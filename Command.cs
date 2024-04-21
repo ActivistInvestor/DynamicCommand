@@ -64,16 +64,45 @@ namespace Autodesk.AutoCAD.Runtime
    /// largely-untested. Please provide feedback if 
    /// you encounter any issues.
    /// 
+   /// There are also some major design decisions that
+   /// are currently being contemplated, relating to
+   /// the singleton pattern, and how that relates to
+   /// using a RelayCommand-type pattern where caller-
+   /// supplied delegates implement the command. 
+   /// 
+   /// The design as-is doesn't allow multiple instances
+   /// of the same derived type to be created, but that
+   /// would be necessary in order to support delegate-
+   /// based command implementation in the same fashion
+   /// that RelayCommand does.
+   /// 
+   /// The roadmap for this type is to fully-incorporate
+   /// DocumentRelayCommand functionality as mentioned 
+   /// above, but that will require significant changes.
+   /// 
+   /// Currently, with the exception of using delegates
+   /// to implement commands, all of DocumentRelayCommand's
+   /// other functionality (e.g., execution in the document
+   /// context, etc.) have been incorporated into this type.
+   /// 
    /// ************** Caveat Emptor ******************
+   /// Notice:
    /// 
    /// This class relies on undocumented, unsupported,
    /// 'for internal use only' APIs. As such, all of
-   /// the standard caveats apply. While I doubt that
-   /// these APIs will suddenly vanish given that the
-   /// people reponsible for the managed API are very
-   /// aware of the fact that customers have come to
-   /// depend on them, one never knows what the future
-   /// holds.
+   /// the standard caveats apply. Any use of this API
+   /// is entirely at your own risk. 
+   /// 
+   /// While I doubt that the unsupported APIs will 
+   /// suddenly vanish given that the people reponsible 
+   /// for them and the managed API are well-aware of 
+   /// the fact that many customers have come to depend 
+   /// on them (mostly out of need, and resulting from 
+   /// significant shortcomings or gaps/holes in the 
+   /// public API) one never knows what the future holds.
+   /// 
+   /// All undocumented/unsupported APIs used by this
+   /// code are also used by AutoCAD's Action Recorder.
    /// 
    /// ************************************************
    /// Required Prerequisites:
@@ -81,55 +110,83 @@ namespace Autodesk.AutoCAD.Runtime
    /// CommandContext.cs   
    /// CommandAttribute.cs 
    /// 
+   /// Notes:
+   /// 
+   /// TODO: Support for localization of command names and
+   ///       various other properties of the CommandAttribute
+   ///       
    /// </summary>
    /// <typeparam name="T">The concrete type that is
-   /// derived from this type</typeparam>
+   /// derived from this type. The name of the derived
+   /// type by-default becomes the name of the command
+   /// unless otherwise specified.</typeparam>
 
    public abstract class Command<T> : IDisposable, ICommand
       where T : Command<T>
    {
       static T instance = null;
+      protected static Collection commands = new Collection();
+
       string name;
+      CommandAttribute attribute;
       CommandFlags flags = CommandFlags.Modal;
-      string group = "DynamicCommands";
+      string group = "DYNAMIC_COMMANDS";
       bool disposed;
       object defaultParameter = null;
       InvocationContext context = InvocationContext.None;
-      protected static Collection commands = new Collection();
-
-      // This will be implemented in a derived type
-      // to support the pattern used by RelayCommand,
-      // once the issue of Singularity is resolved.
-      //
-      // Action<ICommand, object> action = null;
-      //
-      // We have discovered a basic flaw in the design
-      // of RelayCommand, which is that instances of the
-      // command do not pass themselves as a parameter
-      // to the delegate that handles the command. That
-      // makes it difficult to use the same delegate with
-      // multiple RelayCommands, since the delegate has
-      // no way to distinguish which of them called it,
-      // short of resorting to call stack trickery.
 
       protected Command()
       {
-         name = typeof(T).Name;
-         var attribute = this.GetType().GetCustomAttribute<CommandAttribute>(false);
-         if(attribute != null)
-         {
-            if(!string.IsNullOrEmpty(attribute.GlobalName)) 
-               this.name = attribute.GlobalName;
-            this.flags = attribute.Flags;
-            if(!string.IsNullOrEmpty(attribute.GroupName))
-               this.group = attribute.GroupName;
-         }
-         ValidateCommand(name);
-         ValidateInstance();
-         Register(group, name, Flags, execute);
+         this.name = typeof(T).Name;
+         ValidateSingleton();
+         TrySetFromAttribute();
+         Register(this.name, this.execute);
       }
 
-      protected virtual void ValidateInstance()
+      /// <summary>
+      /// Checks for the existence of a CommandAttribute
+      /// applied to the concrete derived type, and if one
+      /// is found, properties of this type are set from 
+      /// the properties of the CommandAttribute.
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
+      /// </summary>
+      /// <returns>A value indicating if a CommandAttribute
+      /// was found.</returns>
+
+      protected bool TrySetFromAttribute()
+      {
+         attribute = this.GetType().GetCustomAttribute<CommandAttribute>(false);
+         if(attribute != null)
+         {
+            if(!string.IsNullOrEmpty(attribute.GlobalName))
+               this.name = attribute.GlobalName;
+            if(!string.IsNullOrEmpty(attribute.GroupName))
+               this.group = attribute.GroupName;
+            this.flags = attribute.Flags;
+            return true;
+         }
+         return false;
+      }
+
+      /// <summary>
+      /// Validates that there is not already an instance of
+      /// the concrete derived type created. If an instance
+      /// has already been created and assigned to the static
+      /// Instance property, an exception should be thrown.
+      /// 
+      /// If an instance has not been previously-created, this 
+      /// instance is assigned to the static Instance property.
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
+      /// </summary>
+      /// <exception cref="InvalidOperationException"></exception>
+
+      protected virtual void ValidateSingleton()
       {
          if(instance != null)
             throw new InvalidOperationException(
@@ -137,28 +194,93 @@ namespace Autodesk.AutoCAD.Runtime
          instance = (T) this;
       }
 
-      protected virtual void ValidateCommand(string name)
+      /// <summary>
+      /// Validates the argument as being elegible for
+      /// registering as a command with the given name.
+      /// If the given name cannot be registered as a 
+      /// command (e.g., the name is already in use) an 
+      /// exception should be thrown.
+      /// 
+      /// If the name argument can be used as the name
+      /// of the registered command, it is assigned to
+      /// the GlobalName property and name field.
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
+      /// </summary>
+      /// <param name="name"></param>
+      /// <exception cref="InvalidOperationException"></exception>
+
+      protected virtual string ValidateCommandName(string name)
       {
          if(commands.Contains(name))
             throw new InvalidOperationException($"Duplicate command name: {name}");
-         var typeflags = Utils.IsCommandNameInUse(name);
-         if(typeflags != CommandTypeFlags.NoneCmd)
+         if(IsCommandNameInUse(name))
             throw new InvalidOperationException(
                $"A command with the name {name} is already defined.");
+         return name;
       }
 
-      protected virtual void Register(string group, string name, CommandFlags flags, CommandCallback callback)
+      /// <summary>
+      /// Registers a command whose group and command 
+      /// names are the values of the GroupName and 
+      /// GlobalName properties respectively, according to
+      /// the CommandFlags returned by the Flags property.
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
+      /// </summary>
+      /// <param name="callback">The action that handles
+      /// the command's invocation</param>
+
+      protected virtual void Register(string name, Action action)
       {
+         this.name = ValidateCommandName(name);
+         /// The name property must be set before
+         /// adding the instance to the collection:
          commands.Add(this);
-         Utils.AddCommand(group, name, name, Flags, callback);
+         Utils.AddCommand(group, name, name, Flags, new CommandCallback(action));
       }
 
-      protected virtual void Revoke(string group, string name)
+      /// <summary>
+      /// Unregisters the previously-registered command
+      /// </summary>
+      /// <param name="group"></param>
+      /// <param name="name"></param>
+
+      protected virtual void Revoke()
       {
          if(instance == this)
             instance = null;
          Utils.RemoveCommand(group, name);
          commands.Remove(this);
+      }
+
+      /// <summary>
+      /// If result is CommandType.Undefined, the command
+      /// is undefined and avaialble for use.
+      /// 
+      /// See Autodesk.AutoCAD.Internal.CommandTypeFlags
+      /// for meanings of other values.
+      /// </summary>
+      /// <param name="name"></param>
+      /// <returns></returns>
+      /// <exception cref="ArgumentException"></exception>
+
+      public static bool IsCommandNameInUse(string name)
+      {
+         if(string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException(nameof(name));
+         return Utils.IsCommandNameInUse(name) != CommandTypeFlags.NoneCmd;
+      }
+
+      public static CommandType GetCommandType(string name)
+      {
+         if(string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException(nameof(name));
+         return (CommandType)Utils.IsCommandNameInUse(name);
       }
 
       public string GlobalName => name;
@@ -177,12 +299,17 @@ namespace Autodesk.AutoCAD.Runtime
          } 
       }
 
+      public bool Executing => Context != InvocationContext.None;
+
       public bool IsModal => !Flags.HasFlag(CommandFlags.Session);
 
       /// <summary>
       /// The parameter passed to Execute() when the command
       /// is invoked as a registered command. If this value is
       /// not set, the value of the Context property is passed.
+      /// This value is also passed to Execute() when invoked
+      /// as an ICommand, if the ICommand.Execute() method is
+      /// passed a null argumment.
       /// </summary>
 
       public object DefaultParameter 
@@ -194,13 +321,21 @@ namespace Autodesk.AutoCAD.Runtime
       /// <summary>
       /// Can be overridden in a derived type to provide
       /// a different set of CommandFlags. Use with care.
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
       /// </summary>
+
       public virtual CommandFlags Flags => flags;
 
       /// <summary>
-      /// Creating multiple instances of derived types is
-      /// not possible. If an instance has already been 
-      /// created, the constructor throws an exception.
+      /// Accesses (and if necessary, creates) the singleton 
+      /// instance of the concrete derived type.
+      /// 
+      /// Creating multiple instances of the same derived 
+      /// type is not possible. If an instance has already 
+      /// been created, the constructor throws an exception.
       /// </summary>
       
       public static T Instance 
@@ -236,13 +371,20 @@ namespace Autodesk.AutoCAD.Runtime
       {
          if(disposing)
          {
-            Revoke(group, name);
+            Revoke();
          }
+      }
+
+      void CheckDisposed()
+      {
+         if(disposed)
+            throw new ObjectDisposedException($"{name} has been disposed.");
       }
 
       /// <summary>
       /// Calling this unregisters the command which 
-      /// will cause it to no longer be available.
+      /// will cause it to no longer be available as
+      /// a registered command.
       /// 
       /// Note that if a command is to have session 
       /// scope, it isn't necessary to call this at 
@@ -444,7 +586,7 @@ namespace Autodesk.AutoCAD.Runtime
 
          protected override string GetKeyForItem(Command<T> item)
          {
-            return item.name;
+            return item.GlobalName;
          }
       }
    }
@@ -456,6 +598,21 @@ namespace Autodesk.AutoCAD.Runtime
       Implicit = 1,        // Invoked by AutoCAD as a registered command
       Explicit = 2,        // Invoked via some other means (e.g., ICommand)
       Session = 4,         // Invoked in application execution context
+   }
+
+   /// <summary>
+   /// Corresponds to Autodesk.AutoCAD.Internal.CommandTypeFlags
+   /// </summary>
+   
+   [Flags]
+   public enum CommandType
+   {
+      Undefined = 0,
+      Core = 1,
+      ARX = 2,
+      Lisp = 3,
+      ActionMacro = 4,
+      Setvar = 5
    }
 
    static class CommandTypeExtensions
