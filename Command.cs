@@ -93,9 +93,13 @@ namespace Autodesk.AutoCAD.Runtime
       CommandFlags flags = CommandFlags.Modal;
       string group = "DynamicCommands";
       bool disposed;
+      object defaultParameter = null;
+      InvocationContext context = InvocationContext.None;
+      protected static Collection commands = new Collection();
 
       // This will be implemented in a derived type
-      // to support the pattern used by RelayCommand.
+      // to support the pattern used by RelayCommand,
+      // once the issue of Singularity is resolved.
       //
       // Action<ICommand, object> action = null;
       //
@@ -104,11 +108,9 @@ namespace Autodesk.AutoCAD.Runtime
       // command do not pass themselves as a parameter
       // to the delegate that handles the command. That
       // makes it difficult to use the same delegate with
-      // multiple RealyCommands, since the delegate has
+      // multiple RelayCommands, since the delegate has
       // no way to distinguish which of them called it,
       // short of resorting to call stack trickery.
-      
-      static Collection commands = new Collection();
 
       protected Command()
       {
@@ -122,23 +124,72 @@ namespace Autodesk.AutoCAD.Runtime
             if(!string.IsNullOrEmpty(attribute.GroupName))
                this.group = attribute.GroupName;
          }
+         ValidateCommand(name);
+         ValidateInstance();
+         Register(group, name, Flags, execute);
+      }
+
+      protected virtual void ValidateInstance()
+      {
          if(instance != null)
             throw new InvalidOperationException(
-               $"Singleton violoation: {name}, Must use the Instance property");
-         var typeflags = Utils.IsCommandNameInUse(name);
-         if(typeflags != CommandTypeFlags.NoneCmd)
-            throw new InvalidOperationException($"A command with the name {name} is already defined.");
+               $"Singleton violation: {name}, Use the Instance property");
+         instance = (T) this;
+      }
+
+      protected virtual void ValidateCommand(string name)
+      {
          if(commands.Contains(name))
             throw new InvalidOperationException($"Duplicate command name: {name}");
-         instance = (T)this;
-         Utils.AddCommand(group, name, name, Flags, execute);
+         var typeflags = Utils.IsCommandNameInUse(name);
+         if(typeflags != CommandTypeFlags.NoneCmd)
+            throw new InvalidOperationException(
+               $"A command with the name {name} is already defined.");
+      }
+
+      protected virtual void Register(string group, string name, CommandFlags flags, CommandCallback callback)
+      {
          commands.Add(this);
+         Utils.AddCommand(group, name, name, Flags, callback);
+      }
+
+      protected virtual void Revoke(string group, string name)
+      {
+         if(instance == this)
+            instance = null;
+         Utils.RemoveCommand(group, name);
+         commands.Remove(this);
       }
 
       public string GlobalName => name;
       public string GroupName => group;
-      protected InvocationContext Context { get; private set; }
+
+      public InvocationContext Context 
+      {
+         get => context;
+         protected set 
+         {
+            if(value != context)
+            {
+               context = value;
+               NotifyCanExecuteChanged();
+            }
+         } 
+      }
+
       public bool IsModal => !Flags.HasFlag(CommandFlags.Session);
+
+      /// <summary>
+      /// The parameter passed to Execute() when the command
+      /// is invoked as a registered command. If this value is
+      /// not set, the value of the Context property is passed.
+      /// </summary>
+
+      public object DefaultParameter 
+      {
+         get => defaultParameter ?? this.Context;
+         set => defaultParameter = value;
+      }
 
       /// <summary>
       /// Can be overridden in a derived type to provide
@@ -169,19 +220,15 @@ namespace Autodesk.AutoCAD.Runtime
 
       void execute()
       {
-         InvocationContext context = InvocationContext.Implicit;
-         if(IsModal)
-            context |= InvocationContext.Modal;
-         this.Context = context;
+         this.Context = InvocationContext.Implicit
+            | (!IsModal ? InvocationContext.Session : 0);
          try
          {
-            NotifyCanExecuteChanged();
-            Execute(context);
+            Execute(DefaultParameter);
          }
          finally 
          {  
             this.Context = InvocationContext.None;
-            NotifyCanExecuteChanged();
          }
       }
 
@@ -189,8 +236,7 @@ namespace Autodesk.AutoCAD.Runtime
       {
          if(disposing)
          {
-            Utils.RemoveCommand(group, name);
-            commands.Remove(this);
+            Revoke(group, name);
          }
       }
 
@@ -214,15 +260,21 @@ namespace Autodesk.AutoCAD.Runtime
       }
 
       /// <summary>
-      /// Convenience properties for use in Execute()
-      /// handlers:
+      /// Convenience properties for use by Execute() overrides:
       /// </summary>
 
+      /// The DocumentCollection
       protected static DocumentCollection Documents => 
          Application.DocumentManager;
+      /// <summary>
+      /// The active Document:
+      /// </summary>
       protected static Document Document =>
          Documents.MdiActiveDocument ??
          throw new Autodesk.AutoCAD.Runtime.Exception(ErrorStatus.NoDocument);
+      /// <summary>
+      /// The active Editor:
+      /// </summary>
       protected static Editor Editor => Document.Editor;
 
       /// <summary>
@@ -265,8 +317,8 @@ namespace Autodesk.AutoCAD.Runtime
 
       async void ICommand.Execute(object parameter)
       {
-         NotifyCanExecuteChanged();
          this.Context = InvocationContext.Explicit;
+         parameter = parameter ?? DefaultParameter;
          try
          {
             if(IsModal && Documents.IsApplicationContext)
@@ -280,7 +332,6 @@ namespace Autodesk.AutoCAD.Runtime
          }
          finally
          {
-            NotifyCanExecuteChanged();
             this.Context = InvocationContext.None;
          }
       }
@@ -350,7 +401,7 @@ namespace Autodesk.AutoCAD.Runtime
       /// which will remove the instance from the collection.
       /// </summary>
 
-      class Collection : KeyedCollection<string, Command<T>>
+      protected class Collection : KeyedCollection<string, Command<T>>
       {
          HashSet<Command<T>> set = new HashSet<Command<T>>();
 
@@ -404,7 +455,7 @@ namespace Autodesk.AutoCAD.Runtime
       None = 0,
       Implicit = 1,        // Invoked by AutoCAD as a registered command
       Explicit = 2,        // Invoked via some other means (e.g., ICommand)
-      Modal = 4,           // Invoked in document execution context
+      Session = 4,         // Invoked in application execution context
    }
 
    static class CommandTypeExtensions
@@ -435,7 +486,6 @@ namespace Autodesk.AutoCAD.Runtime
          return list.SelectMany(asm => asm.ExportedTypes)
            .Where(type => !type.IsAbstract && type.IsSubclassOf(baseType));
       }
-
    }
 
    //////////////////////////////////////////////////////////
@@ -446,12 +496,12 @@ namespace Autodesk.AutoCAD.Runtime
    /// draws a Circle. The name of the command is the name
    /// of the class (MYCIRCLE).
    /// 
-   /// Unlike CommandMethod commands, this command is not
+   /// Unlike CommandMethod commands, the command is not
    /// registered and avaiable for use until an instance of 
    /// the class is created.
    /// 
    /// Also unlike CommandMethod commands, there is not a
-   /// seperate instance of this class created for every
+   /// separate instance of this class created for every
    /// open document. This class is strictly a singleton.
    /// </summary>
    
@@ -505,13 +555,30 @@ namespace Autodesk.AutoCAD.Runtime
    /// CommandFlags.Session flag is present in the Flags, 
    /// the Execute() method runs in the application context.
    
-   /// Example use in an MVVM scenario:
+   /// Example usage in MVVM and UIElement scenarios:
    
    public class MyViewModel
    {
       public ICommand DrawCircleCommand => MyCircle.Instance;
 
       public ICommand DrawLineCommand => CanBeAnyName.Instance;
+   }
+
+   public class Button     // proxy for System.Windows.Controls.Button
+   {
+      public ICommand Command { get; set; }
+   }
+
+   public class ExampleButtons
+   {
+      public Button drawCircleButton = new Button();
+      public Button drawLineButton = new Button();
+
+      public ExampleButtons()
+      {
+         drawCircleButton.Command = MyCircle.Instance;
+         drawLineButton.Command = CanBeAnyName.Instance;
+      }
    }
 
 }
