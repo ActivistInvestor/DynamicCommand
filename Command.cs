@@ -18,7 +18,12 @@ namespace Autodesk.AutoCAD.Runtime
    /// A base type for classes that implement 
    /// dynamically-defined AutoCAD commands that
    /// can act like registered commands and like
-   /// ICommands
+   /// ICommands.
+   /// 
+   /// The novel aspect of this class is that it
+   /// can be used to implement both a registered
+   /// command as well as an ICommand with a single
+   /// unified implementation.
    /// 
    /// To define and implement a command, derive
    /// a type from this class. By default, the name
@@ -31,15 +36,20 @@ namespace Autodesk.AutoCAD.Runtime
    /// can be invoked by issuing the command's name
    /// on the command line, or can be invoked via
    /// the UI framework as an ICommand, by binding
-   /// the static Instance property to any UI
-   /// element's Command property.
+   /// the static Instance property to a UI element's
+   /// Command property or be exposed as a property 
+   /// of a view model class (see the example below).
    /// 
    /// The [Command] Attribute can be applied to a
    /// derived type to specify the same information
    /// which the CommandMethod attribute allows you
    /// to provide (it's essentially a knock-off of
    /// same), such as the command's name, and the
-   /// CommandFlags). See CommandAttribute.cs.
+   /// CommandFlags). See CommandAttribute.cs. 
+   /// 
+   /// In the current version, the only properties
+   /// of the CommandAttribute that are used are
+   /// the GlobalName and Flags properties.
    /// 
    /// Note that the roadmap for this class is to 
    /// merge it with the DocumentRelayCommand class 
@@ -47,8 +57,8 @@ namespace Autodesk.AutoCAD.Runtime
    /// 
    ///   https://github.com/ActivistInvestor/CommunityToolKitExtensions/blob/main/LegacyDocumentRelayCommand.cs
    ///    
-   /// That will provide the ability to implement 
-   /// an ICommand that can also act as a registered 
+   /// That will provide the ability to implement an 
+   /// ICommand that can also act as a registered 
    /// command, and is currently a work-in-progress.
    /// Some of that work is completed, but it remains
    /// largely-untested. Please provide feedback if 
@@ -118,9 +128,9 @@ namespace Autodesk.AutoCAD.Runtime
          var typeflags = Utils.IsCommandNameInUse(name);
          if(typeflags != CommandTypeFlags.NoneCmd)
             throw new InvalidOperationException($"A command with the name {name} is already defined.");
-         instance = (T)this;
          if(commands.Contains(name))
             throw new InvalidOperationException($"Duplicate command name: {name}");
+         instance = (T)this;
          Utils.AddCommand(group, name, name, Flags, execute);
          commands.Add(this);
       }
@@ -128,7 +138,7 @@ namespace Autodesk.AutoCAD.Runtime
       public string GlobalName => name;
       public string GroupName => group;
       protected InvocationContext Context { get; private set; }
-      public bool IsModal => !flags.HasFlag(CommandFlags.Session);
+      public bool IsModal => !Flags.HasFlag(CommandFlags.Session);
 
       /// <summary>
       /// Can be overridden in a derived type to provide
@@ -185,11 +195,12 @@ namespace Autodesk.AutoCAD.Runtime
       }
 
       /// <summary>
-      /// Calling this unregisters the command which will
-      /// no longer be available.
+      /// Calling this unregisters the command which 
+      /// will cause it to no longer be available.
       /// 
-      /// Note that if a command is to have session scope,
-      /// it isn't necessary to call this at shutdown.
+      /// Note that if a command is to have session 
+      /// scope, it isn't necessary to call this at 
+      /// shutdown.
       /// </summary>
 
       public void Dispose()
@@ -207,10 +218,11 @@ namespace Autodesk.AutoCAD.Runtime
       /// handlers:
       /// </summary>
 
+      protected static DocumentCollection Documents => 
+         Application.DocumentManager;
       protected static Document Document =>
-         Application.DocumentManager.MdiActiveDocument ??
+         Documents.MdiActiveDocument ??
          throw new Autodesk.AutoCAD.Runtime.Exception(ErrorStatus.NoDocument);
-
       protected static Editor Editor => Document.Editor;
 
       /// <summary>
@@ -242,7 +254,8 @@ namespace Autodesk.AutoCAD.Runtime
 
       public virtual bool CanExecute(object parameter)
       {
-         return CommandContext.CanInvoke(QuiescentOnly, true);
+         return CommandContext.CanInvoke(QuiescentOnly, true)
+            && Context == InvocationContext.None;
       }
 
       /// <summary>
@@ -256,7 +269,7 @@ namespace Autodesk.AutoCAD.Runtime
          this.Context = InvocationContext.Explicit;
          try
          {
-            if(!Flags.HasFlag(CommandFlags.Session))
+            if(IsModal && Documents.IsApplicationContext)
             {
                await CommandContext.InvokeAsync(() => this.Execute(parameter));
             }
@@ -283,7 +296,7 @@ namespace Autodesk.AutoCAD.Runtime
       /// of the user issuing it. Otherwise this is whatever 
       /// value was passed to the ICommand.Execute() method.</param>
 
-      public abstract void Execute(object parameter);
+      protected abstract void Execute(object parameter);
 
 #if(AUTOINIT) // Currently-disabled, untested
 
@@ -444,7 +457,7 @@ namespace Autodesk.AutoCAD.Runtime
    
    public class MyCircle : Command<MyCircle>
    {
-      public override void Execute(object parameter)
+      protected override void Execute(object parameter)
       {
          Editor.Command("._CIRCLE", "10,10", "2");
       }
@@ -459,7 +472,7 @@ namespace Autodesk.AutoCAD.Runtime
    [Command("MYLINE")]
    public class CanBeAnyName : Command<CanBeAnyName>
    {
-      public override void Execute(object parameter)
+      protected override void Execute(object parameter)
       {
          // Note that because these commands execute
          // in the document context by default, the
@@ -481,11 +494,11 @@ namespace Autodesk.AutoCAD.Runtime
    /// the CommandFlags.Session flag (by default, it does
    /// not). 
    /// 
-   /// The CommandFlags property is virtual and can be
-   /// overridden to provide a different value. Because
-   /// this property is used from the constructor of the
-   /// base type, it cannot be assigned from a derived
-   /// type's constructor.
+   /// The Flags property is virtual and can be overridden 
+   /// to provide a different value. Because this property 
+   /// is used from the constructor of the base type, it 
+   /// cannot be assigned from a derived type's constructor
+   /// (which runs after base type constructors).
    /// 
    /// The CommandFlags can also be assigned using the 
    /// CommandAttribute (see CommandAttribute.cs). If the 
