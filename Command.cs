@@ -31,7 +31,7 @@ namespace Autodesk.AutoCAD.Runtime
    /// can be invoked by issuing the command's name
    /// on the command line, or can be invoked via
    /// the UI framework as an ICommand, by binding
-   /// to the static Instance property to any UI
+   /// the static Instance property to any UI
    /// element's Command property.
    /// 
    /// The [Command] Attribute can be applied to a
