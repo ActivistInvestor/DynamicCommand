@@ -4,9 +4,12 @@ using System.Collections.ObjectModel;
 using System.Linq;
 using System.Reflection;
 using System.Windows.Input;
+using System.Xml.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Internal;
+using static Autodesk.AutoCAD.ExportLayout.Wrappers.ClassIterator;
+using AcRx = Autodesk.AutoCAD.Runtime;
 
 namespace Autodesk.AutoCAD.Runtime
 {
@@ -121,12 +124,13 @@ namespace Autodesk.AutoCAD.Runtime
    /// type by-default becomes the name of the command
    /// unless otherwise specified.</typeparam>
 
-   public abstract class Command<T> : IDisposable, ICommand
-      where T : Command<T>
-   {
-      static T instance = null;
-      protected static Collection commands = new Collection();
+   /// Refactord to encapsulate non-generic functionality
+   /// in a non-generic base type. This was necessary to
+   /// maintain a static dictionary of all derived types.
 
+   public abstract class CommandBase : IDisposable, ICommand
+   {
+      protected static Collection commands = new Collection();
       string name;
       CommandAttribute attribute;
       CommandFlags flags = CommandFlags.Modal;
@@ -134,31 +138,24 @@ namespace Autodesk.AutoCAD.Runtime
       bool disposed;
       object defaultParameter = null;
       InvocationContext context = InvocationContext.None;
+      bool IsDisposed => disposed;
 
-      protected Command()
+      protected CommandBase(string globalName = null)
       {
-         this.name = typeof(T).Name;
-         ValidateSingleton();
-         TrySetFromAttribute();
-         Register(this.name, this.execute);
+         string tempName;
+         if(!string.IsNullOrWhiteSpace(globalName))
+            tempName = globalName.ToUpper();
+         else
+            tempName = this.GetType().Name.ToUpper();
+         this.name = ValidateCommandName(tempName);
+         ValidateSingletonInstance();
+         attribute = TrySetFromAttribute(
+            this.GetType().GetCustomAttribute<CommandAttribute>(false));
+         RegisterCommand(this.name, this.execute);
       }
 
-      /// <summary>
-      /// Checks for the existence of a CommandAttribute
-      /// applied to the concrete derived type, and if one
-      /// is found, properties of this type are set from 
-      /// the properties of the CommandAttribute.
-      /// 
-      /// Note that this is called from the constructor
-      /// of this type, which happens before constructors
-      /// of derived types are called. 
-      /// </summary>
-      /// <returns>A value indicating if a CommandAttribute
-      /// was found.</returns>
-
-      protected bool TrySetFromAttribute()
+      protected CommandAttribute TrySetFromAttribute(CommandAttribute attribute)
       {
-         attribute = this.GetType().GetCustomAttribute<CommandAttribute>(false);
          if(attribute != null)
          {
             if(!string.IsNullOrEmpty(attribute.GlobalName))
@@ -166,19 +163,29 @@ namespace Autodesk.AutoCAD.Runtime
             if(!string.IsNullOrEmpty(attribute.GroupName))
                this.group = attribute.GroupName;
             this.flags = attribute.Flags;
-            return true;
          }
-         return false;
+         return attribute;
       }
 
       /// <summary>
-      /// Validates that there is not already an instance of
-      /// the concrete derived type created. If an instance
-      /// has already been created and assigned to the static
-      /// Instance property, an exception should be thrown.
+      /// It is up to derived types to override this to
+      /// enforce the singleton pattern. This base type
+      /// does not, but provides entry points that allow
+      /// derived types to do it.
       /// 
-      /// If an instance has not been previously-created, this 
-      /// instance is assigned to the static Instance property.
+      /// If a derived type enforces the singleton pattern,
+      /// it should not have a public constructor.
+      /// 
+      /// Enforcing the singleton pattern in derived types
+      /// requires this to be overridden to validates that 
+      /// there is not already an instance of the concrete 
+      /// derived type created. If an instance has already 
+      /// been created and assigned to the static Instance 
+      /// property, an exception should be thrown.
+      /// 
+      /// If an instance has not been previously-created, 
+      /// this instance should be assigned to the static 
+      /// Instance property.
       /// 
       /// Note that this is called from the constructor
       /// of this type, which happens before constructors
@@ -186,12 +193,26 @@ namespace Autodesk.AutoCAD.Runtime
       /// </summary>
       /// <exception cref="InvalidOperationException"></exception>
 
-      protected virtual void ValidateSingleton()
+      protected virtual CommandBase ValidateSingletonInstance()
       {
-         if(instance != null)
-            throw new InvalidOperationException(
-               $"Singleton violation: {name}, Use the Instance property");
-         instance = (T) this;
+         return this;
+      }
+
+      /// <summary>
+      /// Gets the singleton instance if that pattern is
+      /// enforced by a derived type that overrides this
+      /// (in which case, the singleton instance should be 
+      /// the current instance).
+      /// 
+      /// Note that this is called from the constructor
+      /// of this type, which happens before constructors
+      /// of derived types are called. 
+      /// </summary>
+      /// <returns></returns>
+
+      protected virtual CommandBase GetSingletonInstance()
+      {
+         return null;
       }
 
       /// <summary>
@@ -235,13 +256,13 @@ namespace Autodesk.AutoCAD.Runtime
       /// <param name="callback">The action that handles
       /// the command's invocation</param>
 
-      protected virtual void Register(string name, Action action)
+      protected virtual void RegisterCommand(string name, Action action)
       {
-         this.name = ValidateCommandName(name);
+         string cmdName = ValidateCommandName(name);
          /// The name property must be set before
          /// adding the instance to the collection:
-         commands.Add(this);
-         Utils.AddCommand(group, name, name, Flags, new CommandCallback(action));
+         Utils.AddCommand(group, cmdName, cmdName, Flags, new CommandCallback(action));
+         Add(this);
       }
 
       /// <summary>
@@ -250,13 +271,45 @@ namespace Autodesk.AutoCAD.Runtime
       /// <param name="group"></param>
       /// <param name="name"></param>
 
-      protected virtual void Revoke()
+      /// TODO: instance is a static member of derived generic types
+      protected virtual void RevokeCommand()
       {
-         if(instance == this)
-            instance = null;
-         Utils.RemoveCommand(group, name);
-         commands.Remove(this);
+         Utils.RemoveCommand(group, GlobalName);
+         Remove(this);
       }
+
+      /// <summary>
+      /// Provided to inform derived types that enforce 
+      /// a singleton pattern that the singleton instance
+      /// is being disposed, and that they should clear
+      /// the static instance field.
+      /// </summary>
+
+      protected virtual void ClearSingletonInstance()
+      {
+      }
+
+      /// <summary>
+      /// Adds the instance to the dictionary/collection of
+      /// all derived types keyed to their command name.
+      /// </summary>
+      /// <param name="item"></param>
+      /// <exception cref="ArgumentNullException"></exception>
+      /// <exception cref="InvalidOperationException"></exception>
+
+      static void Add(CommandBase item)
+      {
+         if(item == null)
+            throw new ArgumentNullException(nameof(item));
+         if(string.IsNullOrWhiteSpace(item.GlobalName))
+            throw new InvalidOperationException("Global name is null or empty");
+         commands.Add(item);
+      }
+
+      protected static void Contains(CommandBase item)
+         => commands.ContainsItem(item);
+
+      static bool Remove(CommandBase item) => commands.Remove(item);
 
       /// <summary>
       /// If result is CommandType.Undefined, the command
@@ -285,23 +338,30 @@ namespace Autodesk.AutoCAD.Runtime
 
       public string GlobalName => name;
       public string GroupName => group;
+      public bool IsExecuting => Context != InvocationContext.None;
+      public bool IsModal => !Flags.HasFlag(CommandFlags.Session);
 
-      public InvocationContext Context 
+      public InvocationContext Context
       {
          get => context;
-         protected set 
+         protected set
          {
             if(value != context)
             {
                context = value;
                NotifyCanExecuteChanged();
             }
-         } 
+         }
       }
 
-      public bool Executing => Context != InvocationContext.None;
-
-      public bool IsModal => !Flags.HasFlag(CommandFlags.Session);
+      /// <summary>
+      /// Adds the Session flag if this command is not a modal command:
+      /// </summary>
+      
+      protected InvocationContext GetEffectiveContext(InvocationContext invocationContext)
+      {
+         return invocationContext | (!IsModal ? InvocationContext.Session : 0);
+      }
 
       /// <summary>
       /// The parameter passed to Execute() when the command
@@ -312,7 +372,7 @@ namespace Autodesk.AutoCAD.Runtime
       /// passed a null argumment.
       /// </summary>
 
-      public object DefaultParameter 
+      public object DefaultParameter
       {
          get => defaultParameter ?? this.Context;
          set => defaultParameter = value;
@@ -330,61 +390,28 @@ namespace Autodesk.AutoCAD.Runtime
       public virtual CommandFlags Flags => flags;
 
       /// <summary>
-      /// Accesses (and if necessary, creates) the singleton 
-      /// instance of the concrete derived type.
-      /// 
-      /// Creating multiple instances of the same derived 
-      /// type is not possible. If an instance has already 
-      /// been created, the constructor throws an exception.
+      /// disposing should never be false until shutdown,
+      /// because instances are always reachable as long
+      /// as they are elements of the commands collection.
       /// </summary>
-      
-      public static T Instance 
-      { 
-         get 
-         {
-            if(instance == null)
-               Activator.CreateInstance<T>();
-            return instance;
-         } 
-      }
-
-      /// <summary>
-      /// Command callback, invoked by AutoCAD when
-      /// the user issues the registered command.
-      /// </summary>
-
-      void execute()
-      {
-         this.Context = InvocationContext.Implicit
-            | (!IsModal ? InvocationContext.Session : 0);
-         try
-         {
-            Execute(DefaultParameter);
-         }
-         finally 
-         {  
-            this.Context = InvocationContext.None;
-         }
-      }
+      /// <param name="disposing"></param>
 
       protected virtual void Dispose(bool disposing)
       {
          if(disposing)
          {
-            Revoke();
+            RevokeCommand();
+            ClearSingletonInstance();
          }
-      }
-
-      void CheckDisposed()
-      {
-         if(disposed)
-            throw new ObjectDisposedException($"{name} has been disposed.");
       }
 
       /// <summary>
       /// Calling this unregisters the command which 
       /// will cause it to no longer be available as
-      /// a registered command.
+      /// a registered command. It also clears the
+      /// instance field, allowing another instance
+      /// to be created and to become the singleton
+      /// instance.
       /// 
       /// Note that if a command is to have session 
       /// scope, it isn't necessary to call this at 
@@ -402,25 +429,65 @@ namespace Autodesk.AutoCAD.Runtime
       }
 
       /// <summary>
+      /// Command callback, invoked by AutoCAD when
+      /// the user issues the registered command.
+      /// </summary>
+
+      void execute()
+      {
+         Execute(DefaultParameter, InvocationContext.Implicit);
+      }
+
+      void CheckDisposed()
+      {
+         if(disposed)
+            throw new ObjectDisposedException($"{name} has been disposed.");
+      }
+
+      /// <summary>
       /// Convenience properties for use by Execute() overrides:
       /// </summary>
 
       /// The DocumentCollection
-      protected static DocumentCollection Documents => 
+      protected static DocumentCollection Documents =>
          Application.DocumentManager;
-      /// <summary>
-      /// The active Document:
-      /// </summary>
-      protected static Document Document =>
-         Documents.MdiActiveDocument ??
-         throw new Autodesk.AutoCAD.Runtime.Exception(ErrorStatus.NoDocument);
-      /// <summary>
-      /// The active Editor:
-      /// </summary>
-      protected static Editor Editor => Document.Editor;
 
       /// <summary>
-      /// ICommand implementation
+      /// The active Document. Throws an exception if
+      /// there is no active document. 
+      /// 
+      /// Use the HasDocument property to check first 
+      /// if needed.
+      /// </summary>
+
+      protected static Document Document
+      {
+         get
+         {
+            Document doc = Documents.MdiActiveDocument;
+            if(doc == null)
+               throw new AcRx.Exception(ErrorStatus.NoDocument);
+            return doc;
+         }
+      }
+
+      /// <summary>
+      /// Indicates if there is an active document
+      /// </summary>
+
+      public static bool HasDocument => Documents.MdiActiveDocument != null;
+
+      /// <summary>
+      /// The active document's Editor 
+      /// 
+      /// Throws an exception if there is no active document.
+      /// </summary>
+      
+      protected static Editor Editor => Document.Editor;
+
+      //////////////////////////////////////////////////////////////
+      /// <summary>
+      /// ICommand implementation (derived from DocumentRelayCommand)
       /// </summary>
 
       public event EventHandler CanExecuteChanged;
@@ -441,7 +508,16 @@ namespace Autodesk.AutoCAD.Runtime
       public bool QuiescentOnly { get; set; } = false;
 
       /// <summary>
-      /// TODO (Merging with DocumentRelayCommand)
+      /// 
+      /// This method returns true if:
+      /// 
+      ///   1. There is an active document, and
+      ///   
+      ///   2. QuiescentOnly is false, or the active
+      ///      document is quiescent, and
+      ///      
+      ///   3. This command is not currently executing.
+      ///   
       /// </summary>
       /// <param name="parameter"></param>
       /// <returns></returns>
@@ -449,7 +525,7 @@ namespace Autodesk.AutoCAD.Runtime
       public virtual bool CanExecute(object parameter)
       {
          return CommandContext.CanInvoke(QuiescentOnly, true)
-            && Context == InvocationContext.None;
+            && !IsExecuting;
       }
 
       /// <summary>
@@ -457,19 +533,50 @@ namespace Autodesk.AutoCAD.Runtime
       /// </summary>
       /// <param name="parameter"></param>
 
-      async void ICommand.Execute(object parameter)
+      /// Notes: cannot assume that this is being called
+      /// from the application context. So, if the command
+      /// has CommandFlags.Session and this is called from
+      /// the document context, Execute() must be run in
+      /// the application context, which leads us to the
+      /// problem that ExecuteInApplicationContext() may 
+      /// not execute the delegate until after this method 
+      /// returns control to AutoCAD. Still not sure how to 
+      /// deal with this rare edge case.
+
+      void ICommand.Execute(object parameter)
       {
-         this.Context = InvocationContext.Explicit;
+         Execute(parameter, InvocationContext.Explicit);
+      }
+
+      /// <summary>
+      /// Sets up the instance for a call the virtual Execute() method.
+      /// </summary>
+      /// <param name="parameter"></param>
+
+      async void Execute(object parameter, InvocationContext context)
+      {
+         this.Context = GetEffectiveContext(context);
          parameter = parameter ?? DefaultParameter;
          try
          {
-            if(IsModal && Documents.IsApplicationContext)
+            if(Documents.IsApplicationContext)
             {
-               await CommandContext.InvokeAsync(() => this.Execute(parameter));
+               if(IsModal)
+                  await CommandContext.InvokeAsync(() => this.Execute(parameter));
+               else
+                  this.Execute(parameter);
             }
-            else
+            else   // we're running in the document context
             {
-               this.Execute(parameter);
+               if(IsModal)
+                  this.Execute(parameter);
+               else
+                  /// CommandFlags.Session command in document context...
+                  throw new AcRx.Exception(AcRx.ErrorStatus.InvalidContext);
+
+                  // Edge case cannot work because it can't be awaited
+                  //   Documents.ExecuteInApplicationContext(
+                  //      (obj) => this.Execute(parameter), null);
             }
          }
          finally
@@ -479,33 +586,55 @@ namespace Autodesk.AutoCAD.Runtime
       }
 
       /// <summary>
+      /// Provides a means for ad-hoc execution of the command
+      /// from an unknown context.
+      /// </summary>
+      /// <param name="parameter"></param>
+
+      public void ExecuteExternal(object parameter)
+      {
+         Execute(parameter, InvocationContext.External);
+      }
+
+
+      /// <summary>
       /// Override this to implement unified command functionality.
       /// The code in the override of this method will execute in
       /// all execution contexts (e.g., as a registered command or
       /// as an ICommand).
+      /// 
+      /// The Context property of this class indicates how the
+      /// command's execution was initiated (AutoCAD command or
+      /// ICommand.Execute()).
       /// </summary>
-      /// <param name="parameter">InvocationContext.Implicit 
-      /// when the command was invoked by AutoCAD as a result 
-      /// of the user issuing it. Otherwise this is whatever 
-      /// value was passed to the ICommand.Execute() method.</param>
+      /// <param name="parameter">The current value of the Context 
+      /// property when the command was invoked by AutoCAD as a 
+      /// result of the user issuing it. Otherwise this is the value 
+      /// that was passed to the ICommand.Execute() method if not 
+      /// null, or the value of the DefaultParameter property if the 
+      /// value passed to ICommand.Execute() was null.</param>
 
       protected abstract void Execute(object parameter);
+
+
 
 #if(AUTOINIT) // Currently-disabled, untested
 
       /// <summary>
       /// Infrastructure for automated initialization,
-      /// which is a work-in-progress and untested.
+      /// which is disabled because it is currently not 
+      /// working as intended.
       /// 
       /// To trigger Automatic initialization of derived
       /// types in all currently and subsequently-loaded
-      /// assemblies, call the Initalize() method, before
+      /// assemblies, call the Initalize() method before
       /// referencing the Instance property of any derived
       /// type. 
       /// 
-      /// After one or more instances have been created by
-      /// referencing the Instance property or by calling
-      /// a constructor, this method cannot be used.
+      /// After one or more instances of a derived concrete
+      /// type have been created by referencing the Instance 
+      /// property or by calling a constructor, this method 
+      /// cannot be used.
       /// </summary>
 
       static bool initialized = false;
@@ -529,13 +658,14 @@ namespace Autodesk.AutoCAD.Runtime
 
       static void Initialize(Assembly asm)
       {
-         foreach(Type type in typeof(Command<T>).GetTypes(asm))
+         foreach(Type type in typeof(CommandBase).GetTypes(asm))
          {
-            Activator.CreateInstance<T>();
+            Activator.CreateInstance(type);
          }
       }
 
 #endif
+
 
       /// <summary>
       /// Commands should not be explicitly removed from this
@@ -543,15 +673,22 @@ namespace Autodesk.AutoCAD.Runtime
       /// which will remove the instance from the collection.
       /// </summary>
 
-      protected class Collection : KeyedCollection<string, Command<T>>
+      protected class Collection : KeyedCollection<string, CommandBase>
       {
-         HashSet<Command<T>> set = new HashSet<Command<T>>();
+         /// <summary>
+         /// Storing items in triplicate, to allow fast lookup
+         /// of instances as well as command names.
+         /// </summary>
 
-         public Collection() : base(StringComparer.OrdinalIgnoreCase) 
+         HashSet<CommandBase> set = new HashSet<CommandBase>();
+
+         public Collection() : base(StringComparer.OrdinalIgnoreCase)
          {
          }
 
-         protected override void InsertItem(int index, Command<T> item)
+         public bool ContainsItem(CommandBase item) => set.Contains(item);
+
+         protected override void InsertItem(int index, CommandBase item)
          {
             set.Add(item);
             base.InsertItem(index, item);
@@ -573,7 +710,7 @@ namespace Autodesk.AutoCAD.Runtime
             base.ClearItems();
          }
 
-         protected override void SetItem(int index, Command<T> item)
+         protected override void SetItem(int index, CommandBase item)
          {
             var existg = base[index];
             if(existg != item)
@@ -584,20 +721,98 @@ namespace Autodesk.AutoCAD.Runtime
             base.SetItem(index, item);
          }
 
-         protected override string GetKeyForItem(Command<T> item)
+         protected override string GetKeyForItem(CommandBase item)
          {
             return item.GlobalName;
          }
       }
    }
 
+
+   public abstract class Command<T> : CommandBase
+      where T : Command<T>
+   {
+      static T instance = null;
+
+      protected Command()
+      {
+         if(instance == null)
+            instance = (T) this;
+      }
+
+      /// <summary>
+      /// The base type does not enforce the singleton pattern.
+      /// It leaves that up to derived types. This generic type
+      /// must be a singleton, because the command name is by-
+      /// default the name of the class, hence multiple instances 
+      /// of the same type will try to register a command with the 
+      /// same name, causing a failure.
+      /// </summary>
+      /// <returns></returns>
+      /// <exception cref="InvalidOperationException"></exception>
+
+      protected override CommandBase ValidateSingletonInstance()
+      {
+         var instance = GetSingletonInstance();
+         if(instance != null && instance != this)
+            throw new InvalidOperationException(
+               $"Singleton violation: {this.GetType().Name}, Use the Instance property");
+         instance = this;
+         return this;
+      }
+
+      protected override CommandBase GetSingletonInstance()
+      {
+         return instance;
+      }
+
+      /// <summary>
+      /// Provided for future enhancements that might allow 
+      /// multiple instances, along with a 'default' singleton 
+      /// instances (one of several possibilities).
+      /// </summary>
+      
+      public bool IsSingleton => instance == this;
+      
+      /// <summary>
+      /// Clears the singleton instance when it is
+      /// disposed.
+      /// </summary>
+
+      protected override void ClearSingletonInstance()
+      {
+         if(instance == this)
+            instance = null;
+      }
+
+      /// <summary>
+      /// Accesses (and if necessary, creates) the singleton 
+      /// instance of the concrete derived type.
+      /// 
+      /// Creating multiple instances of the same derived 
+      /// type is not possible. If an instance has already 
+      /// been created, the constructor throws an exception.
+      /// </summary>
+
+      public static T Instance 
+      { 
+         get 
+         {
+            if(instance == null)
+               Activator.CreateInstance<T>();
+            return (T) instance;
+         } 
+      }
+   }
+
    [Flags]
    public enum InvocationContext
    {
-      None = 0,
-      Implicit = 1,        // Invoked by AutoCAD as a registered command
-      Explicit = 2,        // Invoked via some other means (e.g., ICommand)
-      Session = 4,         // Invoked in application execution context
+      None = 0,       // Not currently executing.
+      Implicit = 1,   // Invoked by AutoCAD as a registered command
+      Explicit = 2,   // Invoked via some other means (e.g., ICommand)
+      Session = 4,    // Executing in the application execution context
+      External = 8    // Invoked by a call to ExternalExecute() 
    }
 
    /// <summary>
@@ -632,7 +847,7 @@ namespace Autodesk.AutoCAD.Runtime
       /// <returns></returns>
       /// <exception cref="ArgumentNullException"></exception>
       
-      public static IEnumerable<Type> GetTypes(this Type baseType, Assembly asm = null)
+      public static IEnumerable<Type> GetConcreteTypes(this Type baseType, Assembly asm = null)
       {
          if(baseType == null)
             throw new ArgumentNullException(nameof(baseType));
