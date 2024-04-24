@@ -8,7 +8,6 @@ using System.Xml.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Internal;
-using static Autodesk.AutoCAD.ExportLayout.Wrappers.ClassIterator;
 using AcRx = Autodesk.AutoCAD.Runtime;
 
 namespace Autodesk.AutoCAD.Runtime
@@ -258,10 +257,7 @@ namespace Autodesk.AutoCAD.Runtime
 
       protected virtual void RegisterCommand(string name, Action action)
       {
-         string cmdName = ValidateCommandName(name);
-         /// The name property must be set before
-         /// adding the instance to the collection:
-         Utils.AddCommand(group, cmdName, cmdName, Flags, new CommandCallback(action));
+         Utils.AddCommand(group, name, name, Flags, new CommandCallback(action));
          Add(this);
       }
 
