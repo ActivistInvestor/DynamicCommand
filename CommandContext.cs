@@ -10,25 +10,17 @@ using AcRx = Autodesk.AutoCAD.Runtime;
 namespace Autodesk.AutoCAD.ApplicationServices
 {
 
-   /// <summary>
-   /// This class encapsulates and isolates all AutoCAD API-
-   /// dependent functionality. Generally, types that use the
-   /// methods of this class should not contain AutoCAD types 
-   /// or method calls, espcially if they contain methods that
-   /// can be jit'd at design-time.
-   /// </summary>
-
    public static class CommandContext
    {
       static readonly DocumentCollection docs = Application.DocumentManager;
 
       /// <summary>
-      /// Gets a value indicating if an operation can execute 
-      /// based on two conditions:
+      /// Gets a value indicating if an operation can
+      /// execute, based on two conditions:
       /// 
-      ///   1. If there is an open document.
+      ///   1. If there is an active document.
       ///   
-      ///   2. If there is an open document 
+      ///   2. If there is an active document 
       ///      that is in a quiescent state.
       ///      
       /// To find out if an operation can execute, requiring
@@ -39,6 +31,16 @@ namespace Autodesk.AutoCAD.ApplicationServices
       ///      
       /// The arguments specify which of the conditions are
       /// applicable and tested.
+      /// 
+      /// Note that this API interprets an active 'non-document'
+      /// tab (such as the New Document tab) the same as no open
+      /// documents, where the intent is to determine if a command 
+      /// or operation that depends on an active document can run.
+      /// 
+      /// Both the Invoke() and InvokeAsync() overloads of this 
+      /// class throw an eNoDocument exception when called while
+      /// there is no active document, so this API can be used to 
+      /// check that before calling them.
       /// </summary>
       /// <param name="quiescentOnly">A value indicating if the
       /// operation cannot be performed if the document is not 
@@ -50,14 +52,16 @@ namespace Autodesk.AutoCAD.ApplicationServices
       public static bool CanInvoke(bool quiescentOnly = false, bool documentRequired = true)
       {
          Document doc = docs.MdiActiveDocument;
-         return (!documentRequired || doc != null)
-            && (!quiescentOnly || doc.Editor.IsQuiescent);
+         return doc == null ? !documentRequired 
+            : !quiescentOnly || doc.Editor.IsQuiescent;
       }
 
       /// <summary>
       /// Returns a value indicating if the active 
       /// document is quiescent.
-      /// Returns false if there is no document.
+      /// 
+      /// >>> Returns false if there is no active document <<<
+      /// 
       /// </summary>
 
       public static bool IsQuiescent =>
@@ -70,7 +74,11 @@ namespace Autodesk.AutoCAD.ApplicationServices
       public static bool IsApplicationContext => docs.IsApplicationContext;
 
       /// <summary>
-      /// Return a value indicating if there is an active document
+      /// Returns a value indicating if there is an active document
+      /// 
+      /// This value can be false even when there are one or more
+      /// open documents, in which case there is a 'non-document'
+      /// tab active, such as the New Document tab.
       /// </summary>
       public static bool HasDocument => docs.MdiActiveDocument != null;
 
@@ -84,7 +92,7 @@ namespace Autodesk.AutoCAD.ApplicationServices
       /// are 3 overloads of both InvokeAsync() and Invoke(). 
       /// 
       /// The three overloads of Invoke() and InvokeAsync() vary only
-      /// by the delegate type (Action, Action<T>, and Action<Document>).
+      /// by delegate type (Action, Action<T>, and Action<Document>).
       /// 
       /// InvokeAsync() overloads return a Task and can be awaited.
       /// 
@@ -211,8 +219,6 @@ namespace Autodesk.AutoCAD.ApplicationServices
       }
 
 
-
-
       /// <summary>
       /// Invokes the given action in the document execution context
       /// </summary>
@@ -249,7 +255,7 @@ namespace Autodesk.AutoCAD.ApplicationServices
       /// Returns an Action that when invoked, will 
       /// execute the argument action in the document
       /// execution context. The returned Action can
-      /// replace the argument.
+      /// impersonate and replace the argument.
       /// 
       /// It is recommended that the delegate not capture
       /// the active document, or anything dependent on the
@@ -260,26 +266,83 @@ namespace Autodesk.AutoCAD.ApplicationServices
       /// </summary>
       /// <param name="action">The action that is to
       /// execute in the document execution context</param>
+      /// <paramref name="async"/>A value indicating if the
+      /// call to the <paramref name="action"/> should be 
+      /// aynchronously waited.</param>
       /// <returns>An action that executes the given <paramref name="action"/>
       /// in the document execution context</returns>
 
-      public static Action DocInvoke(this Action action)
+      /// TODO:
+      /// Prototype for revisions to eliminate DocInvokeAsync()
+      /// overloads, in favor of an optional async argument to
+      /// overloads of this method.
+
+      public static Action DocInvoke(this Action action, bool async = false)
       {
          if(action == null)
             throw new ArgumentNullException(nameof(action));
-         return () => { var unused = InvokeAsync(action); };
+         if(!async)
+            return () => Invoke(action);
+         else
+            return async () => await InvokeAsync(action);
       }
 
       /// <summary>
       /// Can be invoked on an EventHandler to cause it to
-      /// execute in the document context:
+      /// execute in the document context. The result of
+      /// this method wraps the event handler, and can be
+      /// added to the event. See the example below.
 
-      public static EventHandler DocInvoke(this EventHandler handler)
+      /// TODO:
+      /// Prototype for revisions to eliminate DocInvokeAsync()
+      /// overloads, in favor of an optional async argument to
+      /// overloads of DocInvoke()
+
+      public static EventHandler DocInvoke(this EventHandler handler, bool async = false)
       {
-         return delegate(object sender, EventArgs e)
+         if(!async)
+            return (s, e) => Invoke(() => handler(s, e));
+         else
+            return async (s, e) => await InvokeAsync(() => handler(s, e));
+      }
+
+      /// <summary>
+      /// This example shows how to use DocInvoke() to cause a
+      /// handler for the Application.Idle event to run in the
+      /// Document execution context:
+      /// </summary>
+
+      public static class Example
+      {
+         public static void Run()
          {
-            var unused = InvokeAsync(() => handler(sender, e));
-         };
+            /// Add the event:
+            Application.Idle += docIdle;
+
+            /// Remove the event:
+            Application.Idle -= docIdle;
+         }
+
+         /// <summary>
+         /// The wrapped handler for the idle event:
+         /// </summary>
+
+         static EventHandler docIdle = ((EventHandler)idle).DocInvoke();
+
+         /// <summary>
+         /// The handler for the idle event:
+         /// </summary>
+
+         private static void idle(object sender, EventArgs e)
+         {
+            Application.DocumentManager.MdiActiveDocument.Editor
+               .WriteMessage("\nI'm running in the document context");
+            
+            /// Remove the event (note that the 
+            /// wrapped event handler is passed):
+
+            Application.Idle -= docIdle;
+         }
       }
 
       /// <summary>
@@ -309,8 +372,12 @@ namespace Autodesk.AutoCAD.ApplicationServices
       {
          if(action == null)
             throw new ArgumentNullException(nameof(action));
-         return () => { var unused = InvokeAsync(action); };
+         return () => Invoke(action); 
       }
+
+      /// <summary>
+      /// TODO: Will replace these with optional async arguments to the above
+      /// </summary>
 
       public static Action DocInvokeAsync(this Action action)
       {
